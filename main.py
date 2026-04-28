@@ -1,6 +1,9 @@
 import os
+import sys
 import logging
 import json
+import re
+import traceback
 from datetime import datetime, time
 import pytz
 import gspread
@@ -11,31 +14,58 @@ from telegram.ext import (
     CallbackQueryHandler, ContextTypes, filters
 )
 
-# ──────────────────────────────────────────────────────────────
-#  НАСТРОЙКИ
-# ──────────────────────────────────────────────────────────────
-BOT_TOKEN   = os.environ["BOT_TOKEN"]
-SHEET_ID    = os.environ["SHEET_ID"]
-WEBHOOK_URL = os.environ["WEBHOOK_URL"]   # https://ВАШ_ПРОЕКТ.railway.app
-PORT        = int(os.environ.get("PORT", 8080))
-TIMEZONE    = pytz.timezone("Asia/Dushanbe")
-
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    stream=sys.stdout
+)
 logger = logging.getLogger(__name__)
+
+# ──────────────────────────────────────────────────────────────
+#  НАСТРОЙКИ — с явной диагностикой при запуске
+# ──────────────────────────────────────────────────────────────
+logger.info("=== WORKTRACK BOT STARTING ===")
+
+try:
+    BOT_TOKEN = os.environ["BOT_TOKEN"]
+    logger.info("OK BOT_TOKEN loaded")
+except KeyError:
+    logger.error("FAIL BOT_TOKEN not set"); sys.exit(1)
+
+try:
+    SHEET_ID = os.environ["SHEET_ID"]
+    logger.info("OK SHEET_ID loaded")
+except KeyError:
+    logger.error("FAIL SHEET_ID not set"); sys.exit(1)
+
+try:
+    WEBHOOK_URL = os.environ["WEBHOOK_URL"].rstrip("/")
+    logger.info(f"OK WEBHOOK_URL: {WEBHOOK_URL}")
+except KeyError:
+    logger.error("FAIL WEBHOOK_URL not set"); sys.exit(1)
+
+try:
+    creds_raw = os.environ["GOOGLE_CREDS"]
+    json.loads(creds_raw)
+    logger.info("OK GOOGLE_CREDS loaded and valid")
+except KeyError:
+    logger.error("FAIL GOOGLE_CREDS not set"); sys.exit(1)
+except json.JSONDecodeError as e:
+    logger.error(f"FAIL GOOGLE_CREDS invalid JSON: {e}"); sys.exit(1)
+
+PORT     = int(os.environ.get("PORT", 8080))
+TIMEZONE = pytz.timezone("Asia/Dushanbe")
+logger.info(f"OK PORT: {PORT}")
 
 # ──────────────────────────────────────────────────────────────
 #  GOOGLE SHEETS
 # ──────────────────────────────────────────────────────────────
-def get_gc():
-    creds_json = os.environ["GOOGLE_CREDS"]  # JSON строка из переменной окружения
-    creds_dict = json.loads(creds_json)
+def get_sheets():
+    creds_dict = json.loads(os.environ["GOOGLE_CREDS"])
     scopes = ["https://spreadsheets.google.com/feeds",
               "https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-    return gspread.authorize(creds)
-
-def get_sheets():
-    gc = get_gc()
+    gc = gspread.authorize(creds)
     ss = gc.open_by_key(SHEET_ID)
     return ss.worksheet("Users"), ss.worksheet("Attendance")
 
@@ -64,10 +94,6 @@ def find_att_row(chat_id, date_str):
         if row and str(row[1]) == str(chat_id) and row[0] == date_str:
             return i, row
     return None, None
-
-def create_att_row(chat_id):
-    _, att_ws = get_sheets()
-    att_ws.append_row([today_str(), str(chat_id), "", "", "Ожидание", ""])
 
 def update_att_cell(row_num, col, value):
     _, att_ws = get_sheets()
@@ -104,9 +130,9 @@ def calendar_keyboard(year, month):
     return InlineKeyboardMarkup(buttons)
 
 # ──────────────────────────────────────────────────────────────
-#  СОСТОЯНИЕ РЕГИСТРАЦИИ (в памяти — достаточно для бота)
+#  СОСТОЯНИЕ РЕГИСТРАЦИИ
 # ──────────────────────────────────────────────────────────────
-reg_state = {}  # { chat_id: { "step": 1, "name": "...", "dept": "..." } }
+reg_state = {}
 
 # ──────────────────────────────────────────────────────────────
 #  HANDLERS
@@ -114,7 +140,6 @@ reg_state = {}  # { chat_id: { "step": 1, "name": "...", "dept": "..." } }
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = find_user(chat_id)
-
     if user:
         await update.message.reply_text(
             f"👋 С возвращением, <b>{user['name']}</b>!\nИспользуй кнопки 👇",
@@ -134,19 +159,15 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = find_user(chat_id)
     if not user: return
-
     msg = await update.message.reply_text("⏳ Считаю статистику...")
-
     _, att_ws = get_sheets()
     rows = att_ws.get_all_values()
     now = datetime.now(TIMEZONE)
     cm, cy = now.month, now.year
-
     work, rest, pending, total_h = 0, 0, 0, 0.0
     for row in rows[1:]:
         if not row or str(row[1]) != str(chat_id): continue
-        try:
-            d = datetime.strptime(row[0], "%d.%m.%Y")
+        try: d = datetime.strptime(row[0], "%d.%m.%Y")
         except: continue
         if d.month != cm or d.year != cy: continue
         if row[4] == "Рабочий":
@@ -155,18 +176,16 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except: pass
         elif row[4] == "Выходной": rest += 1
         else: pending += 1
-
     months_ru = ["","Январь","Февраль","Март","Апрель","Май","Июнь",
                  "Июль","Август","Сентябрь","Октябрь","Ноябрь","Декабрь"]
     avg = round(total_h / work, 1) if work else 0
-
     await msg.edit_text(
         f"📊 <b>Статистика за {months_ru[cm]} {cy}</b>\n"
         f"👤 {user['name']} · {user['department']}\n\n"
         f"🟢 Рабочих дней: <b>{work}</b>\n"
         f"🔵 Выходных: <b>{rest}</b>\n"
         f"⏳ Нет данных: <b>{pending}</b>\n\n"
-        f"⏱ Всего часов: <b>{round(total_h, 1)} ч.</b>\n"
+        f"⏱ Всего часов: <b>{round(total_h,1)} ч.</b>\n"
         f"📈 Среднее в день: <b>{avg} ч.</b>",
         parse_mode="HTML"
     )
@@ -175,14 +194,11 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = find_user(chat_id)
     if not user: return
-
     msg = await update.message.reply_text("⏳ Загружаю...")
     row_num, row = find_att_row(chat_id, today_str())
-
     if not row_num:
         await msg.edit_text("ℹ️ Данных за сегодня ещё нет.")
         return
-
     await msg.edit_text(
         f"📅 <b>Сегодня {today_str()}</b>\n"
         f"👤 {user['name']}\n\n"
@@ -196,8 +212,7 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(TIMEZONE)
     await update.message.reply_text(
-        "📅 <b>Выбери дату:</b>",
-        parse_mode="HTML",
+        "📅 <b>Выбери дату:</b>", parse_mode="HTML",
         reply_markup=calendar_keyboard(now.year, now.month - 1)
     )
 
@@ -216,7 +231,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     text_low = text.lower()
 
-    # Кнопки меню
     if text == "📊 Статистика": await cmd_stats(update, context); return
     if text == "📅 Сегодня":    await cmd_today(update, context); return
     if text == "📆 По дате":    await cmd_date(update, context);  return
@@ -225,30 +239,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Регистрация
     if chat_id in reg_state:
         state = reg_state[chat_id]
-        step = state["step"]
-
+        step  = state["step"]
         if step == 1:
             state["name"] = text
             state["step"] = 2
             await update.message.reply_text(
-                f"✅ ФИО: <b>{text}</b>\n\n"
-                "<b>Шаг 2 из 3</b>\nВ каком отделе работаешь?\n"
-                "<code>Разработка / Бухгалтерия / HR</code>",
+                f"✅ ФИО: <b>{text}</b>\n\n<b>Шаг 2 из 3</b>\n"
+                "В каком отделе работаешь?\n<code>Разработка / Бухгалтерия / HR</code>",
                 parse_mode="HTML"
             )
-
         elif step == 2:
             state["dept"] = text
             state["step"] = 3
             await update.message.reply_text(
-                f"✅ Отдел: <b>{text}</b>\n\n"
-                "<b>Шаг 3 из 3 — Подтверди:</b>\n\n"
-                f"👤 ФИО: <b>{state['name']}</b>\n"
-                f"🏢 Отдел: <b>{text}</b>\n\n"
+                f"✅ Отдел: <b>{text}</b>\n\n<b>Шаг 3 из 3 — Подтверди:</b>\n\n"
+                f"👤 ФИО: <b>{state['name']}</b>\n🏢 Отдел: <b>{text}</b>\n\n"
                 "Напиши <b>да</b> для завершения или <b>нет</b> для отмены.",
                 parse_mode="HTML"
             )
-
         elif step == 3:
             if text_low == "да":
                 save_user(chat_id, state["name"], state["dept"])
@@ -263,31 +271,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             else:
                 del reg_state[chat_id]
-                await update.message.reply_text(
-                    "❌ Регистрация отменена.\nНапиши /start чтобы начать заново."
-                )
+                await update.message.reply_text("❌ Регистрация отменена.\nНапиши /start чтобы начать заново.")
         return
 
-    # Незарегистрированный
     user = find_user(chat_id)
     if not user:
         await update.message.reply_text("❗ Напиши /start чтобы зарегистрироваться.")
         return
 
-    # Ответы на вопросы о времени
     row_num, row = find_att_row(chat_id, today_str())
-    if not row_num: return
+
+    # Если строки нет (бот спал в 09:00) — создаём автоматически
+    if not row_num:
+        _, att_ws = get_sheets()
+        att_ws.append_row([today_str(), str(chat_id), "", "", "Ожидание", ""])
+        row_num, row = find_att_row(chat_id, today_str())
+        if not row_num: return
 
     status, start_time, end_time = row[4], row[2], row[3]
 
-    # Утренний вопрос
     if status == "Ожидание" and not start_time:
         if text_low in ("выходной", "нет"):
             update_att_cell(row_num, 5, "Выходной")
             await update.message.reply_text("✅ Записал — выходной день 🏖️")
-        elif __import__("re").match(r"^\d{1,2}:\d{2}$", text):
-            t = text.zfill(5) if len(text) == 4 else text
-            t = f"{t[:2].zfill(2)}:{t[3:]}"
+        elif re.match(r"^\d{1,2}:\d{2}$", text):
+            parts = text.split(":")
+            t = f"{parts[0].zfill(2)}:{parts[1]}"
             update_att_cell(row_num, 3, t)
             update_att_cell(row_num, 5, "Рабочий")
             await update.message.reply_text(f"✅ Начало: <b>{t}</b> — хорошего дня! 💪", parse_mode="HTML")
@@ -295,15 +304,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❓ Напиши время: <code>09:00</code> или <b>выходной</b>", parse_mode="HTML")
         return
 
-    # Вечерний вопрос
     if status == "Рабочий" and not end_time:
         if text_low == "продолжаю":
             await update.message.reply_text("💪 Ок! Напиши время сам когда закончишь.")
-        elif __import__("re").match(r"^\d{1,2}:\d{2}$", text):
-            t = f"{text[:2].zfill(2)}:{text[3:]}"
+        elif re.match(r"^\d{1,2}:\d{2}$", text):
+            parts = text.split(":")
+            t  = f"{parts[0].zfill(2)}:{parts[1]}"
             sp = list(map(int, start_time.split(":")))
             ep = list(map(int, t.split(":")))
-            h = round(((ep[0]*60 + ep[1]) - (sp[0]*60 + sp[1])) / 60, 1)
+            h  = round(((ep[0]*60 + ep[1]) - (sp[0]*60 + sp[1])) / 60, 1)
             update_att_cell(row_num, 4, t)
             update_att_cell(row_num, 6, h if h > 0 else 0)
             await update.message.reply_text(
@@ -314,13 +323,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❓ Напиши: <code>17:00</code> или <b>продолжаю</b>", parse_mode="HTML")
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
+    query   = update.callback_query
     chat_id = query.message.chat_id
-    data = query.data
+    data    = query.data
 
     if data == "IGNORE":
-        await query.answer()
-        return
+        await query.answer(); return
 
     if data.startswith("CAL_"):
         _, y, m = data.split("_")
@@ -335,38 +343,30 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, year, month, day = data.split("_")
         year, month, day = int(year), int(month), int(day)
         await query.answer("⏳ Загружаю...")
-
-        ds = f"{day:02d}.{month+1:02d}.{year}"
+        ds      = f"{day:02d}.{month+1:02d}.{year}"
         row_num, row = find_att_row(chat_id, ds)
-        user = find_user(chat_id)
-
+        user    = find_user(chat_id)
         if row_num:
-            text = (
-                f"📅 <b>{ds}</b>\n👤 {user['name']}\n\n"
-                f"Статус: <b>{row[4] or '—'}</b>\n"
-                f"Начало: <b>{row[2] or '—'}</b>\n"
-                f"Конец:  <b>{row[3] or '—'}</b>\n"
-                f"Часов:  <b>{row[5] or '—'}</b>"
-            )
+            text = (f"📅 <b>{ds}</b>\n👤 {user['name']}\n\n"
+                    f"Статус: <b>{row[4] or '—'}</b>\n"
+                    f"Начало: <b>{row[2] or '—'}</b>\n"
+                    f"Конец:  <b>{row[3] or '—'}</b>\n"
+                    f"Часов:  <b>{row[5] or '—'}</b>")
         else:
             text = f"ℹ️ За <b>{ds}</b> нет данных."
-
         await query.message.reply_text(text, parse_mode="HTML")
 
 # ──────────────────────────────────────────────────────────────
-#  РАССЫЛКИ (job_queue)
+#  РАССЫЛКИ
 # ──────────────────────────────────────────────────────────────
 async def send_morning(context: ContextTypes.DEFAULT_TYPE):
     users_ws, att_ws = get_sheets()
-    users = users_ws.get_all_values()
     td = today_str()
-
-    for row in users[1:]:
+    for row in users_ws.get_all_values()[1:]:
         if not row: continue
         chat_id, name = row[0], row[1]
-        row_num, _ = find_att_row(chat_id, td)
-        if row_num: continue
-
+        rn, _ = find_att_row(chat_id, td)
+        if rn: continue
         att_ws.append_row([td, str(chat_id), "", "", "Ожидание", ""])
         await context.bot.send_message(
             chat_id=int(chat_id),
@@ -377,17 +377,14 @@ async def send_morning(context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def send_evening(context: ContextTypes.DEFAULT_TYPE):
-    users_ws, att_ws = get_sheets()
-    users = users_ws.get_all_values()
+    users_ws, _ = get_sheets()
     td = today_str()
-
-    for row in users[1:]:
+    for row in users_ws.get_all_values()[1:]:
         if not row: continue
         chat_id, name = row[0], row[1]
-        row_num, att_row = find_att_row(chat_id, td)
-        if not row_num: continue
+        rn, att_row = find_att_row(chat_id, td)
+        if not rn: continue
         if att_row[4] == "Выходной" or att_row[3]: continue
-
         await context.bot.send_message(
             chat_id=int(chat_id),
             text=f"🌆 <b>Планируешь заканчивать, {name}?</b>\n\n"
@@ -400,25 +397,43 @@ async def send_evening(context: ContextTypes.DEFAULT_TYPE):
 #  ЗАПУСК
 # ──────────────────────────────────────────────────────────────
 def main():
+    logger.info("Building application...")
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Команды
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("date",  cmd_date))
     app.add_handler(CommandHandler("help",  cmd_help))
-
-    # Сообщения и кнопки
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
-    # Рассылки по расписанию
     job_queue = app.job_queue
-    job_queue.run_daily(send_morning, time=time(9, 0,  tzinfo=TIMEZONE))
+    job_queue.run_daily(send_morning, time=time(9,  0,  tzinfo=TIMEZONE))
     job_queue.run_daily(send_evening, time=time(16, 30, tzinfo=TIMEZONE))
 
-    # Webhook
+    # Health check — UptimeRobot пингует этот URL чтобы Render не засыпал
+    async def health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("✅ Bot is running")
+    app.add_handler(CommandHandler("health", health))
+
+    # Запускаем утреннюю рассылку при старте если уже 09:00+
+    # (на случай если Render перезапустился после 09:00)
+    async def startup_check(app):
+        now = datetime.now(TIMEZONE)
+        if now.hour >= 9:
+            try:
+                from telegram.ext import CallbackContext
+                class FakeCtx:
+                    def __init__(self, bot): self.bot = bot
+                fake = FakeCtx(app.bot)
+                await send_morning(fake)
+                logger.info("Startup morning check done")
+            except Exception as e:
+                logger.error(f"Startup check error: {e}")
+    app.post_init = startup_check
+
+    logger.info(f"Starting webhook on port {PORT}...")
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
@@ -427,4 +442,9 @@ def main():
     )
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        logger.error(f"FATAL: {e}")
+        traceback.print_exc()
+        sys.exit(1)
