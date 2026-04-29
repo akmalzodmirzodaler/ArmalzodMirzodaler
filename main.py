@@ -417,20 +417,28 @@ def main():
         await update.message.reply_text("✅ Bot is running")
     app.add_handler(CommandHandler("health", health))
 
-    # Запускаем утреннюю рассылку при старте если уже 09:00+
-    # (на случай если Render перезапустился после 09:00)
+    # Запускаем утреннюю рассылку при старте ТОЛЬКО если
+    # Render перезапустился после 09:00 И строк ещё нет в таблице
     async def startup_check(app):
         now = datetime.now(TIMEZONE)
-        if now.hour >= 9:
-            try:
-                from telegram.ext import CallbackContext
-                class FakeCtx:
-                    def __init__(self, bot): self.bot = bot
-                fake = FakeCtx(app.bot)
-                await send_morning(fake)
-                logger.info("Startup morning check done")
-            except Exception as e:
-                logger.error(f"Startup check error: {e}")
+        if now.hour < 9:
+            return  # ещё рано — job_queue сам отправит в 09:00
+        try:
+            # Проверяем — уже есть хоть одна строка за сегодня?
+            _, att_ws = get_sheets()
+            rows = att_ws.get_all_values()[1:]
+            today = now.strftime("%d.%m.%Y")
+            already_sent = any(r and r[0] == today for r in rows)
+            if already_sent:
+                logger.info("Startup check: morning already sent, skipping")
+                return
+            # Строк нет — значит бот не работал в 09:00, отправляем
+            class FakeCtx:
+                def __init__(self, bot): self.bot = bot
+            await send_morning(FakeCtx(app.bot))
+            logger.info("Startup check: morning sent (bot was down at 09:00)")
+        except Exception as e:
+            logger.error(f"Startup check error: {e}")
     app.post_init = startup_check
 
     logger.info(f"Starting webhook on port {PORT}...")
