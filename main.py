@@ -131,7 +131,7 @@ def get_day_stats(chat_id: int, date_str: str) -> dict | None:
 MAIN_KB = ReplyKeyboardMarkup([
     ["📊 Статистика", "📅 Сегодня"],
     ["📆 По дате",    "ℹ️ Помощь"],
-], resize_keyboard=True, persistent=True)
+], resize_keyboard=True)
 
 def calendar_kb(year: int, month: int) -> InlineKeyboardMarkup:
     import calendar
@@ -359,6 +359,8 @@ async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML", reply_markup=MAIN_KB)
 
 async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
     chat_id = update.effective_chat.id
     text    = update.message.text.strip()
 
